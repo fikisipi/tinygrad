@@ -1,6 +1,6 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
 from __future__ import annotations
-import math, functools, itertools
+import math, functools, itertools, operator
 import numpy as np
 from typing import List, Tuple, Callable, Optional, ClassVar, Type, Union, Sequence
 from tinygrad.helpers import prod, argfix, make_pair, getenv, IMAGE, DEBUG, flatten, DType, dtypes, LazyNumpyArray
@@ -33,9 +33,9 @@ class Tensor:
   no_grad: ClassVar[bool] = False
   default_type: ClassVar[DType] = dtypes.float32
 
-  def __init__(self, data:Union[list, LazyBuffer, LazyNumpyArray, np.ndarray], device=Device.DEFAULT, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
+  def __init__(self, data:Union[int, float, list, LazyBuffer, LazyNumpyArray, np.ndarray], device=Device.DEFAULT, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
     device = (device.split(":", 1)[0].upper() + ((":"+device.split(":", 1)[1]) if ':' in device else '')).replace(":0", "")  # canonicalize device
-    if isinstance(data, list):
+    if isinstance(data, (int, float, list)):
       data = np.array(data, dtype=(dtype if dtype is not None else Tensor.default_type).np)
     elif isinstance(data, LazyBuffer) and data.device != device:
       # TODO: this has to realize, it shouldn't have to
@@ -47,7 +47,6 @@ class Tensor:
     # by here, it's either LazyNumpyArray or LazyBuffer
     # TODO: it should all be LazyBuffer I think
     if isinstance(data, LazyNumpyArray):
-      data = data if data.shape else data.reshape((1,))
       lazydata = LazyBuffer.fromCPU(data.astype(dtype.np) if dtype is not None else data, device)
     elif isinstance(data, LazyBuffer):
       assert dtype is None or dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
@@ -122,13 +121,23 @@ class Tensor:
   # ***** creation helper functions *****
 
   @staticmethod
-  def zeros(*shape, **kwargs): return Tensor([0], **kwargs).reshape([1]*len(shape)).expand(shape).contiguous()
+  def full(shape:Tuple[int, ...], fill_value, **kwargs): return Tensor(fill_value, **kwargs).reshape([1]*len(new_shape := argfix(shape))).expand(new_shape).contiguous()
 
   @staticmethod
-  def ones(*shape, **kwargs): return Tensor([1], **kwargs).reshape([1]*len(shape)).expand(shape).contiguous()
+  def zeros(*shape, **kwargs): return Tensor.full(argfix(*shape), 0, **kwargs)
 
   @staticmethod
-  def zeros_like(tensor, **kwargs): return Tensor.zeros(*tensor.shape, **kwargs)
+  def ones(*shape, **kwargs): return Tensor.full(argfix(*shape), 1, **kwargs)
+
+  @staticmethod
+  def full_like(tensor, fill_value, dtype:Optional[DType]=None, **kwargs):
+    return Tensor.full(tensor.shape, fill_value, dtype=tensor.dtype if dtype is None else dtype, **kwargs)
+
+  @staticmethod
+  def zeros_like(tensor, **kwargs): return Tensor.full_like(tensor, 0, **kwargs)
+
+  @staticmethod
+  def ones_like(tensor, **kwargs): return Tensor.full_like(tensor, 1, **kwargs)
 
   @staticmethod
   def empty(*shape, device=Device.DEFAULT, dtype:Optional[DType]=None, **kwargs):
@@ -164,7 +173,7 @@ class Tensor:
   # ***** rng hlops *****
 
   @staticmethod
-  def uniform(*shape, **kwargs) -> Tensor: return Tensor.rand(*shape, **kwargs) * 2 - 1
+  def uniform(*shape, low=-1.0, high=1.0, **kwargs) -> Tensor: return ((high-low) * Tensor.rand(*shape, **kwargs)) + low
 
   @staticmethod
   def scaled_uniform(*shape, **kwargs) -> Tensor: return Tensor.uniform(*shape, **kwargs).mul(prod(shape)**-0.5)
@@ -173,8 +182,13 @@ class Tensor:
   @staticmethod
   def glorot_uniform(*shape, **kwargs) -> Tensor: return Tensor.uniform(*shape, **kwargs).mul((6/(shape[0]+prod(shape[1:])))**0.5)
 
-  # ***** toposort and backward pass *****
+  # https://pytorch.org/docs/stable/_modules/torch/nn/init.html#kaiming_uniform_
+  @staticmethod
+  def kaiming_uniform(*shape, a:float = 0.01, **kwargs) -> Tensor:
+    bound = math.sqrt(3.0) * math.sqrt(2.0 / (1 + a ** 2)) / math.sqrt(shape[1] * prod(shape[2:]))
+    return Tensor.uniform(*shape, low=-bound, high=bound)
 
+  # ***** toposort and backward pass *****
   def deepwalk(self):
     def _deepwalk(node, visited, nodes):
       visited.add(node)
@@ -186,11 +200,11 @@ class Tensor:
     return _deepwalk(self, set(), [])
 
   def backward(self):
-    assert self.shape == (1,)
+    assert self.shape == tuple(), f"backward can only be called for scalar tensors, but it has shape {self.shape})"
 
     # fill in the first grad with one. don't use Tensor.ones because we don't need contiguous
     # this is "implicit gradient creation"
-    self.grad = Tensor([1], device=self.device, requires_grad=False)
+    self.grad = Tensor(1, device=self.device, requires_grad=False)
 
     for t0 in reversed(self.deepwalk()):
       if not any(x.requires_grad for x in t0._ctx.parents):
@@ -210,7 +224,7 @@ class Tensor:
 
   def reshape(self, shape, *args) -> Tensor:
     new_shape = argfix(shape, *args)
-    assert len(new_shape) > 0 and all(x != 0 for x in new_shape), f"zeros not allowed in shape {new_shape}"
+    assert all(x != 0 for x in new_shape), f"zeros not allowed in shape {new_shape}"
     return mlops.Reshape.apply(self, shape=tuple(-prod(self.shape) // prod(new_shape) if s == -1 else s for s in new_shape))
   def expand(self, shape, *args) -> Tensor: return mlops.Expand.apply(self, shape=tuple(x if x != -1 else s for s,x in zip(self.shape, argfix(shape, *args))))
   def permute(self, order, *args) -> Tensor: return mlops.Permute.apply(self, order=argfix(order, *args))
@@ -226,45 +240,71 @@ class Tensor:
     padding = tuple((max(0, -p[0]), max(0, p[1]-self.shape[i])) for i,p in enumerate(arg_))
     return self.pad(padding).shrink(tuple((p[0] + padding[i][0], p[1] + padding[i][0]) for i,p in enumerate(arg_)))
 
-  # Tensors mostly follow the normal python indexing / slicing behavior for sequences
   # - Negative indices are taken relative to the end of the sequence, so X[-2] returns the 2nd-to-last element
   # - A slice i:j returns the elements with indices in [i, j)
-  #   - If omitted, i and j will default to 0 and N, respectively, where N is the length of the sequence
-  #   - Negative values for i and j are taken relative to the end of the sequence
-  #   - Both i and j will be clamped to the range (-N, N], where N in the length of the sequence
+  #    - If omitted, i and j will default to 0 and N, respectively, where N is the length of the sequence
+  #    - Negative values for i and j are taken relative to the end of the sequence
+  #    - Both i and j will be clamped to the range (-N, N], where N in the length of the sequence
   # - Indexing with np.newaxis or None on a given axis will add a new dimension of size one before that axis
-  # - Empty slices are not allowed
-  # - Strides other than 1 are not allowed
+  # - Empty slices are not allowed (tensors with 0s in shape have to be supported first, for all backends).
+  # - Strides other than 1 are now allowed!:
+  #    - This works by applying Shrink -> [Pad -> Reshape -> Shrink] -> Reshape (ops in brackets are optionals)
+  #    - Idea of stride `s` > 1 support (Pad -> Reshape -> Shrink):
+  #        - Instead of doing [::s] on axis [dim_sz], do [:, 0] on axes [dim_sz_padded // s, s].
+  #        - So pad dim_sz with as many zeros as needed (dim_sz -> dim_sz_padded) so that reshape to [dim_sz_padded // s, s]
+  #          is possible.
+  #        - Apply Shrink to do the slice [:, 0] on axes of shapes [dim_sz_padded // s, s].
   def __getitem__(self, val):
-    def slcfix(i, sz, default): return default if i is None else max(0, min(sz, sz+i if i < 0 else i))  # Fix negative idxs, clamp to [0,N]
-    new_slice, new_shape = [], []
-    val = [val] if not isinstance(val, (list, tuple)) else val
-    ellipsis_found = [i for i, v in enumerate(val) if v is Ellipsis]
-    if len(ellipsis_found) > 0:
+    def normalize_int(e, i, dim_sz):
+      if -dim_sz <= e < dim_sz: return e if e != -1 else dim_sz-1
+      raise IndexError(f"index {e} is out of bounds for dimension {i} with size {self.shape[i]}")
+    val = list(val) if isinstance(val, tuple) else [val]
+    ellipses_found = [i for i, v in enumerate(val) if v is Ellipsis]
+    if len(ellipses_found) > 0:
       # If we encounter an ellipsis, we need to expand it to fill all dimensions by inserting N x slice(None)
-      assert len(ellipsis_found) == 1 # Multiple ellipses are not allowed
+      assert len(ellipses_found) == 1 # Multiple ellipses are not allowed
       ellipsis_fill_count = len(self.shape) - len(val) + 1
       # Since lists and tuples cannot be concatenated, make sure val is composed of 3 tuples:
       # (slices before ellipsis) + (N * slice(None)) + (slices after ellipsis) 
-      val = tuple(val[:ellipsis_found[0]]) + tuple([slice(None)]) * ellipsis_fill_count + tuple(val[ellipsis_found[0] + 1:])
-    assert sum(s is not None for s in val) <= len(self.shape)
-    assert all(s.step is None or s.step == 1 for s in val if isinstance(s, slice))
-    for i,(sz,s) in enumerate(zip(self.shape, [v for v in val if v is not None])):  # Slicing only depends on ints + slices
-      if isinstance(s, int) and not (-sz <= s < sz):
-        raise IndexError(f"index {s} is out of bounds for dimension {i} with size {sz}")
-      new_slice.append((s%sz, s%sz+1) if isinstance(s, int) else (slcfix(s.start, sz, 0), slcfix(s.stop, sz, sz)))
-    for s,sz in zip(val, [self.shape[i-1] for i in itertools.accumulate([int(s is not None) for s in val])]):  # Shape depends on slices + positions of Nones
-      if not isinstance(s, int):
-        new_shape.append(1 if s is None else slcfix(s.stop, sz, sz) - slcfix(s.start, sz, 0))
-    new_shape += [self.shape[i] for i in range(len(new_slice), len(self.shape))]
-    new_slice += [(0,self.shape[i]) for i in range(len(new_slice), len(self.shape))]
-    return self.slice(new_slice).reshape(new_shape if len(new_shape) else (1,))
+      val = tuple(val[:ellipses_found[0]]) + tuple([slice(None)]) * ellipsis_fill_count + tuple(val[ellipses_found[0] + 1:])
+    if (num_slices := sum(isinstance(v, (slice, int)) for v in val)) > len(self.shape):
+      raise IndexError(f"too many indices for tensor of dimension {len(self.shape)}")
+    orig_slices = list(val) + [slice(None)] * (len(self.shape) - num_slices)
+    valid_slices = list(itertools.filterfalse(lambda x: x is None, orig_slices))
+    valid_slices = [v if isinstance(v, slice) else slice(y := normalize_int(v, i, dim_sz), y+1) for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape))]
+    start, stop, strides = zip(*y) if (y := [s.indices(dim_sz) for s, dim_sz in zip(valid_slices, self.shape)]) else ((), (), ())
+    new_slice = tuple((s, e) for s, e in zip(start, stop))
+    new_shape = tuple(e - s for s, e in new_slice)
+    # Shrink
+    sliced_tensor = self.shrink(new_slice)
+    if any(s > 1 for s in strides):
+      def num_zeros(step, dim_sz): return 0 if step == 1 or (y := dim_sz % step) == 0 else (step - y)
+      # Pad: add pad at the end: [dim_sz] -> [dim_sz_padded]
+      paddings = tuple((0, num_zeros(s, dim_sz)) for s, dim_sz in zip(strides, sliced_tensor.shape))
+      padded_tensor = sliced_tensor.pad(paddings)
+      # Reshape: [dim_sz_padded] -> [dim_sz_padded // s, s]
+      new_shape = functools.reduce(operator.add, [[sh // s, s] for sh, s in zip(padded_tensor.shape, strides)], [])  # type: ignore
+      reshaped_tensor = padded_tensor.reshape(new_shape)
+      # Shrink: do [:, 0]
+      new_shape = new_shape[::2]
+      final_slice = functools.reduce(operator.add, (((0, sh), (0, 1)) for sh in new_shape), ())
+      sliced_tensor = reshaped_tensor.shrink(final_slice)
+    final_shape = []
+    it_shape = iter(new_shape)
+    for i in orig_slices:
+      if isinstance(i, (int, slice)):
+        dim_shape = next(it_shape)
+        if isinstance(i, slice): final_shape.append(dim_shape)
+      else: # i is None
+        final_shape.append(1)
+    return sliced_tensor.reshape(tuple(final_shape))  # Reshape
 
   def cat(self, *args, dim=0):
     dim = (dim + len(self.shape)) if dim < 0 else dim
     for y in args:
       assert len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim)
     catargs = [self] + list(args)
+    assert all(len(t.shape) != 0 for t in catargs), "zero-dimensional tensor cannot be concatenated"
     shape_cumsum = [0, *itertools.accumulate([y.shape[dim] for y in catargs])]
     slc = [[(0, s) for s in self.shape] for _ in catargs]
     for s,k in zip(slc, shape_cumsum):
@@ -319,7 +359,7 @@ class Tensor:
     axis_ = [x if x >= 0 else x+len(self.shape) for x in axis_]
     shape = [self.shape[i] for i in range(len(self.shape)) if i not in axis_]
     ret = fxn.apply(self, new_shape=tuple(1 if i in axis_ else self.shape[i] for i in range(len(self.shape))))
-    return ret if keepdim else ret.reshape(shape=[1] if shape == [] else shape)
+    return ret if keepdim else ret.reshape(shape=shape)
 
   def sum(self, axis=None, keepdim=False): return self._reduce(mlops.Sum, axis, keepdim)
   def max(self, axis=None, keepdim=False): return self._reduce(mlops.Max, axis, keepdim)
@@ -393,13 +433,14 @@ class Tensor:
       x = x.pad(((0,0), (0,0), *flatten(((0,0),(0,s-1)) for s in stride)))
       x = x.reshape(*x.shape[:2], *[k*s for k,s in zip(x.shape[2::2], stride)])
       x = x.shrink(((0,x.shape[0]), (0,x.shape[1]), *[(0,k-(s-1)) for k,s in zip(x.shape[2:], stride)]))
-    # TODO: the make_pair on padding is wrong in the asymmetric padding case
-    return x.conv2d(w.reshape(w.shape[0]*w.shape[1],*w.shape[2:]), groups=groups, bias=bias, dilation=dilation, padding=flatten(((k-1)*d-p,(k-1)*d-p) for k,p,d in zip(HW, make_pair(padding, len(HW)), make_pair(dilation, len(HW)))))
+    padding = flatten(((k-1)*d-p,(k-1)*d-p) for k,p,d in reversed(list(zip(HW, make_pair(padding, len(HW)), make_pair(dilation, len(HW))))))
+    return x.conv2d(w.reshape(w.shape[0]*w.shape[1],*w.shape[2:]), groups=groups, bias=bias, dilation=dilation, padding=padding)
 
   def conv2d(self, weight:Tensor, bias:Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0) -> Tensor:
     (bs,cin_), (cout,cin), HW = self.shape[:2], weight.shape[:2], weight.shape[2:]
     assert groups*cin == cin_ and len(self.shape) == len(weight.shape), f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups*cin} vs. {cin_})"
-    padding_ = [padding]*4 if isinstance(padding, int) else (padding if len(padding) >= 4 else [padding[1], padding[1], padding[0], padding[0]])
+    if isinstance(padding, (tuple,list)): assert len(padding) == 2*len(HW) or len(padding) == len(HW), f"Expected padding of length {2*len(HW)} or {len(HW)}, but got {len(padding)} for tensor of shape {self.shape}"
+    padding_ = [padding]*2*len(HW) if isinstance(padding, int) else (padding if len(padding) == 2*len(HW) else [p for p in padding for _ in range(2)][::-1])
 
     # conv2d is a pooling op (with padding)
     x = self.pad2d(padding_)._pool(HW, stride, dilation)   # (bs, groups*cin, oy, ox, H, W)
@@ -417,6 +458,7 @@ class Tensor:
     return ret if bias is None else ret.add(bias.reshape(1, -1, *[1 for _ in range(len(HW))]))
 
   def dot(self, w:Tensor) -> Tensor:
+    if (n1:=len(self.shape))*(n2:=len(w.shape)) == 0: raise RuntimeError(f"both arguments to matmul need to be at least 1D, but they are {n1}D and {n2}D")
     x = self.reshape(*self.shape[0:-1], 1, self.shape[-1])
     w = w.reshape(*w.shape[0:-2], 1, w.shape[-2], w.shape[-1]).transpose(-1, -2)
     r = (x*w).sum(-1)
@@ -463,7 +505,7 @@ class Tensor:
   # ***** broadcasted binary mlops *****
 
   def _broadcasted(self, fxn:Type[Function], other:Union[Tensor, float], reverse:bool=False) -> Tensor:
-    x,y = [Tensor([t], device=self.device, requires_grad=False) if not isinstance(t, Tensor) else t for t in ([other,self] if reverse else [self,other])]
+    x,y = [Tensor(t, device=self.device, requires_grad=False) if not isinstance(t, Tensor) else t for t in ([other,self] if reverse else [self,other])]
     x,y = [t.reshape([1]*(max(len(x.shape), len(y.shape))-len(t.shape)) + list(t.shape)) for t in [x,y]]
     shape_ret = tuple(max(sx, sy) for sx,sy in zip(x.shape, y.shape))
     return fxn.apply(x.expand(shape_ret), y.expand(shape_ret))
